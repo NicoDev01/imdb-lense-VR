@@ -395,12 +395,7 @@ export class NativeARPluginWeb extends WebPlugin implements NativeARPluginInterf
   }
   
   async cropObject(options: { objectId: string }): Promise<CropResult> {
-    const obj = this.trackedObjects.get(options.objectId);
-    if (!obj) {
-      throw new Error('Object not found');
-    }
-    
-    if (!this.videoElement || !this.canvasElement) {
+    if (!this.videoElement) {
       throw new Error('Camera not initialized');
     }
     
@@ -409,6 +404,27 @@ export class NativeARPluginWeb extends WebPlugin implements NativeARPluginInterf
     const ctx = canvas.getContext('2d');
     if (!ctx) {
       throw new Error('Failed to get canvas context');
+    }
+    
+    // Special case: full frame capture
+    if (options.objectId === '__fullframe__') {
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      ctx.drawImage(video, 0, 0);
+      
+      const imageBase64 = canvas.toDataURL('image/jpeg', 0.8);
+      return {
+        objectId: '__fullframe__',
+        imageBase64,
+        width: video.videoWidth,
+        height: video.videoHeight
+      };
+    }
+    
+    // Normal object crop
+    const obj = this.trackedObjects.get(options.objectId);
+    if (!obj) {
+      throw new Error('Object not found');
     }
     
     // Convert normalized bbox to pixel coordinates

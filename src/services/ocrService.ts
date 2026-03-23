@@ -58,6 +58,216 @@ export const initializeGemini = async () => {
   }
 };
 
+// ============================================================================
+// NEW: Analyze full frame to detect movie covers with bounding boxes
+// ============================================================================
+export interface DetectedCover {
+  title: string;
+  boundingBox: {
+    x: number;      // normalized 0-1
+    y: number;      // normalized 0-1
+    width: number;  // normalized 0-1
+    height: number; // normalized 0-1
+  };
+  confidence: 'high' | 'medium' | 'low';
+}
+
+export interface FrameAnalysisResult {
+  covers: DetectedCover[];
+  rawResponse: string;
+}
+
+/**
+ * Analyze a full camera frame to detect movie/series covers with their positions
+ * Uses Gemini Vision to identify covers and estimate their bounding boxes
+ */
+export const analyzeFrameForCovers = async (imageBase64: string): Promise<FrameAnalysisResult> => {
+  try {
+    if (!model) {
+      await initializeGemini();
+    }
+
+    // Extract base64 data
+    let base64Data: string;
+    let mimeType: string;
+
+    if (imageBase64.startsWith('data:')) {
+      const [mimePart, dataPart] = imageBase64.split(',');
+      mimeType = mimePart.split(':')[1].split(';')[0];
+      base64Data = dataPart;
+    } else {
+      mimeType = 'image/jpeg';
+      base64Data = imageBase64;
+    }
+
+    // Prompt optimized for cover detection with positions
+    const prompt = `Analysiere dieses Bild nach Film- oder Serien-Covern (Poster/Thumbnails).
+
+Für JEDEN sichtbaren Film/Serien-Cover, gib folgendes zurück:
+- Titel des Films/der Serie
+- Position als Prozent vom Bild (0-100): left, top, width, height
+
+Antworte NUR im folgenden JSON-Format, keine anderen Texte:
+{
+  "covers": [
+    {
+      "title": "Filmtitel",
+      "left": 10,
+      "top": 20,
+      "width": 15,
+      "height": 25,
+      "confidence": "high"
+    }
+  ]
+}
+
+Regeln:
+- left/top ist die obere linke Ecke in Prozent (0-100)
+- width/height ist die Größe in Prozent des Bildes
+- confidence: "high" wenn Cover klar erkennbar, "medium" wenn teilweise sichtbar, "low" wenn unsicher
+- Wenn KEINE Cover erkennbar sind, gib {"covers": []} zurück
+- Behalte deutsche Umlaute im Titel bei`;
+
+    const result = await model.generateContent([
+      { text: prompt },
+      { inlineData: { data: base64Data, mimeType: mimeType } }
+    ]);
+    
+    const response = await result.response;
+    const text = response.text();
+    
+    console.log('[OCR] Gemini Cover Analysis Response:', text);
+
+    // Parse JSON response
+    const covers = parseCoverResponse(text);
+    
+    return {
+      covers,
+      rawResponse: text
+    };
+  } catch (error) {
+    console.error('Error in analyzeFrameForCovers:', error);
+    return { covers: [], rawResponse: '' };
+  }
+};
+
+/**
+ * Parse Gemini's JSON response for cover detection
+ */
+function parseCoverResponse(response: string): DetectedCover[] {
+  try {
+    // Extract JSON from response (handle markdown code blocks)
+    let jsonStr = response.trim();
+    
+    // Remove markdown code blocks if present
+    if (jsonStr.startsWith('```json')) {
+      jsonStr = jsonStr.slice(7);
+    } else if (jsonStr.startsWith('```')) {
+      jsonStr = jsonStr.slice(3);
+    }
+    if (jsonStr.endsWith('```')) {
+      jsonStr = jsonStr.slice(0, -3);
+    }
+    jsonStr = jsonStr.trim();
+
+    const parsed = JSON.parse(jsonStr);
+    
+    if (!parsed.covers || !Array.isArray(parsed.covers)) {
+      return [];
+    }
+
+    return parsed.covers.map((cover: any) => ({
+      title: cover.title || 'Unknown',
+      boundingBox: {
+        x: (cover.left || 0) / 100,
+        y: (cover.top || 0) / 100,
+        width: (cover.width || 10) / 100,
+        height: (cover.height || 15) / 100
+      },
+      confidence: cover.confidence || 'medium'
+    })).filter((c: DetectedCover) => c.title && c.title !== 'Unknown');
+  } catch (e) {
+    console.warn('Failed to parse cover response:', e);
+    return [];
+  }
+}
+
+/**
+ * Validate if a cropped image is a movie/series cover and extract the title
+ * More reliable than just OCR - asks Gemini directly
+ */
+export interface CoverValidationResult {
+  isMovieCover: boolean;
+  title: string | null;
+  confidence: 'high' | 'medium' | 'low';
+}
+
+export const validateAndExtractCover = async (imageBase64: string): Promise<CoverValidationResult> => {
+  try {
+    if (!model) {
+      await initializeGemini();
+    }
+
+    let base64Data: string;
+    let mimeType: string;
+
+    if (imageBase64.startsWith('data:')) {
+      const [mimePart, dataPart] = imageBase64.split(',');
+      mimeType = mimePart.split(':')[1].split(';')[0];
+      base64Data = dataPart;
+    } else {
+      mimeType = 'image/jpeg';
+      base64Data = imageBase64;
+    }
+
+    const prompt = `Ist dieses Bild ein Film- oder Serien-Cover/Poster/Thumbnail?
+
+Antworte NUR im JSON-Format:
+{
+  "isMovieCover": true/false,
+  "title": "Filmtitel oder null",
+  "confidence": "high/medium/low"
+}
+
+Regeln:
+- isMovieCover: true wenn es ein erkennbares Film/Serien-Cover ist
+- title: Der Film/Serientitel wenn erkennbar, sonst null
+- confidence: "high" wenn Cover und Titel klar erkennbar
+- Behalte deutsche Umlaute im Titel bei (ä, ö, ü, ß)`;
+
+    const result = await model.generateContent([
+      { text: prompt },
+      { inlineData: { data: base64Data, mimeType: mimeType } }
+    ]);
+    
+    const response = await result.response;
+    const text = response.text();
+    
+    console.log('[OCR] Cover Validation Response:', text);
+
+    // Parse response
+    try {
+      let jsonStr = text.trim();
+      if (jsonStr.startsWith('```json')) jsonStr = jsonStr.slice(7);
+      else if (jsonStr.startsWith('```')) jsonStr = jsonStr.slice(3);
+      if (jsonStr.endsWith('```')) jsonStr = jsonStr.slice(0, -3);
+      jsonStr = jsonStr.trim();
+
+      const parsed = JSON.parse(jsonStr);
+      return {
+        isMovieCover: parsed.isMovieCover || false,
+        title: parsed.title || null,
+        confidence: parsed.confidence || 'low'
+      };
+    } catch {
+      return { isMovieCover: false, title: null, confidence: 'low' };
+    }
+  } catch (error) {
+    console.error('Error in validateAndExtractCover:', error);
+    return { isMovieCover: false, title: null, confidence: 'low' };
+  }
+};
+
 export const extractTextFromImage = async (imageUrl: string): Promise<string[]> => {
   try {
     if (!model) {
@@ -66,7 +276,6 @@ export const extractTextFromImage = async (imageUrl: string): Promise<string[]> 
     }
 
     console.log('Starting text extraction from image...');
-    console.log('Image URL:', imageUrl.substring(0, 50) + '...');
 
     // Extract base64 data from data URL
     let base64Data: string;
@@ -80,8 +289,6 @@ export const extractTextFromImage = async (imageUrl: string): Promise<string[]> 
       throw new Error('Unsupported image format. Expected data URL.');
     }
 
-    console.log('Processing image with Gemini...');
-
     // Create the prompt for movie title extraction
     const prompt = `Analysiere dieses Bild und extrahiere alle sichtbaren Film- oder Serientitel.
     Gib jeden Titel zurück, einen pro Zeile.
@@ -92,14 +299,6 @@ export const extractTextFromImage = async (imageUrl: string): Promise<string[]> 
     Ignoriere alle anderen Texte wie Schauspielernamen, Regisseure, Genres, etc.
     Wenn mehrere Titel auf dem Bild sind, liste jeden separat auf.
     Antworte nur mit den Titeln, keine zusätzlichen Erklärungen.`;
-
-    // Prepare the image part
-    const imagePart = {
-      inlineData: {
-        data: base64Data,
-        mimeType: mimeType,
-      },
-    };
 
     // Generate content
     const result = await model.generateContent([

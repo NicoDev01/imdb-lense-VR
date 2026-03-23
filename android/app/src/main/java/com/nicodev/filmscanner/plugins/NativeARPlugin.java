@@ -286,6 +286,25 @@ public class NativeARPlugin extends Plugin {
     private void analyzeFrame(@NonNull ImageProxy imageProxy) {
         long now = System.currentTimeMillis();
         
+        // Always capture frame for full-frame capture support
+        // Even when not detecting, keep updating lastFrame
+        android.media.Image mediaImage = imageProxy.getImage();
+        if (mediaImage != null) {
+            try {
+                // Update lastFrame more frequently for full-frame capture
+                if (lastFrame == null || now - lastDetectionTime > 500) {
+                    Bitmap newFrame = imageProxyToBitmap(imageProxy);
+                    if (newFrame != null) {
+                        lastFrame = newFrame;
+                        frameWidth = lastFrame.getWidth();
+                        frameHeight = lastFrame.getHeight();
+                    }
+                }
+            } catch (Exception e) {
+                Log.e(TAG, "Frame capture failed", e);
+            }
+        }
+        
         // Throttle detection
         if (now - lastDetectionTime < DETECTION_INTERVAL_MS || !isDetecting) {
             imageProxy.close();
@@ -293,14 +312,12 @@ public class NativeARPlugin extends Plugin {
         }
         lastDetectionTime = now;
         
-        android.media.Image mediaImage = imageProxy.getImage();
         if (mediaImage == null) {
             imageProxy.close();
             return;
         }
 
         try {
-            // Keep a reference to the bitmap for cropping later if needed
             InputImage image = InputImage.fromMediaImage(mediaImage, imageProxy.getImageInfo().getRotationDegrees());
             
             textRecognizer.process(image)
@@ -352,14 +369,6 @@ public class NativeARPlugin extends Plugin {
                     detections = nonMaxSuppression(detections, 0.3f);
                     
                     if (!detections.isEmpty()) {
-                        if (lastFrame == null || now - lastDetectionTime > 1000) { 
-                             lastFrame = imageProxyToBitmap(imageProxy);
-                             if (lastFrame != null) {
-                                 frameWidth = lastFrame.getWidth();
-                                 frameHeight = lastFrame.getHeight();
-                             }
-                        }
-                        
                         updateTracking(detections);
                         notifyDetections();
                     }
@@ -717,12 +726,46 @@ public class NativeARPlugin extends Plugin {
     
     /**
      * Crop a detected object and return as Base64
+     * Special case: objectId "__fullframe__" returns the full frame
      */
     @PluginMethod
     public void cropObject(PluginCall call) {
         String objectId = call.getString("objectId");
         
-        if (objectId == null || !trackedObjects.containsKey(objectId)) {
+        if (objectId == null) {
+            call.reject("ObjectId required");
+            return;
+        }
+        
+        // Special case: full frame capture for Gemini Vision analysis
+        if ("__fullframe__".equals(objectId)) {
+            if (lastFrame == null) {
+                call.reject("No frame available");
+                return;
+            }
+            
+            try {
+                ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                lastFrame.compress(Bitmap.CompressFormat.JPEG, 80, baos);
+                byte[] imageBytes = baos.toByteArray();
+                String base64 = Base64.encodeToString(imageBytes, Base64.NO_WRAP);
+                
+                JSObject result = new JSObject();
+                result.put("objectId", "__fullframe__");
+                result.put("imageBase64", "data:image/jpeg;base64," + base64);
+                result.put("width", lastFrame.getWidth());
+                result.put("height", lastFrame.getHeight());
+                call.resolve(result);
+                return;
+            } catch (Exception e) {
+                Log.e(TAG, "Failed to capture full frame", e);
+                call.reject("Failed to capture full frame: " + e.getMessage());
+                return;
+            }
+        }
+        
+        // Normal object crop
+        if (!trackedObjects.containsKey(objectId)) {
             call.reject("Object not found");
             return;
         }

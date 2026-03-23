@@ -1,10 +1,10 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { Button } from '@/components/ui/button';
-import { XIcon, Loader2, ZoomIn, ZoomOut } from 'lucide-react';
-import { extractTextFromImage } from '@/services/ocrService';
-import { fetchMovieData } from '@/services/movieService';
+import { XIcon, Loader2, ZoomIn, ZoomOut, Camera, RefreshCw } from 'lucide-react';
+import { analyzeFrameForCovers, DetectedCover } from '@/services/ocrService';
+import { fetchMovieData, MovieDataResponse } from '@/services/movieService';
 import { useQueryClient } from '@tanstack/react-query';
-import NativeAR, { TrackedObject, DetectionUpdateEvent } from '@/plugins/NativeARPlugin';
+import NativeAR, { ZoomInfo } from '@/plugins/NativeARPlugin';
 import { Capacitor } from '@capacitor/core';
 
 interface ARScannerProps {
@@ -13,81 +13,110 @@ interface ARScannerProps {
   isScanning: boolean;
 }
 
+interface EnrichedCover extends DetectedCover {
+  movieData?: MovieDataResponse;
+  isLoading?: boolean;
+}
+
 export const ARScanner = ({ onTitleFound, onClose, isScanning }: ARScannerProps) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const videoRef = useRef<HTMLVideoElement>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [currentZoom, setCurrentZoom] = useState(1.0);
   const [maxZoom, setMaxZoom] = useState(1.0);
+  const [isNative, setIsNative] = useState(false);
   const queryClient = useQueryClient();
   
-  // Tracking state
-  const [trackedObjects, setTrackedObjects] = useState<TrackedObject[]>([]);
-  const isProcessingRef = useRef<boolean>(false);
-  const processedIdsRef = useRef<Set<string>>(new Set());
+  // Detection state
+  const [detectedCovers, setDetectedCovers] = useState<EnrichedCover[]>([]);
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const lastAnalysisTime = useRef(0);
+  const streamRef = useRef<MediaStream | null>(null);
   
-  // Cache for known titles
-  const titleCacheRef = useRef<Map<string, { rating: string; votes: string }>>(new Map());
+  // Cache for movie data
+  const movieCache = useRef<Map<string, MovieDataResponse>>(new Map());
   
-  // Frame dimensions for overlay rendering
-  const frameDimensionsRef = useRef({ width: 1280, height: 720 });
-  
-  // Stability threshold for OCR trigger
-  const STABILITY_TRIGGER = 8;
+  // Analysis interval (ms) - how often to analyze frame
+  const ANALYSIS_INTERVAL = 2000; // 2 seconds between full frame analysis
   
   // Debug logs
   const [logs, setLogs] = useState<string[]>([]);
   const addLog = useCallback((msg: string) => {
     console.log(`[ARScanner] ${msg}`);
-    setLogs(prev => [msg, ...prev].slice(0, 8));
+    setLogs(prev => [msg, ...prev].slice(0, 6));
   }, []);
   
-  // Initialize camera and detection
+  // Initialize camera
   useEffect(() => {
     let cleanup: (() => void) | null = null;
-    
-    // Make background transparent for camera visibility
-    const originalBodyBg = document.body.style.backgroundColor;
-    const originalHtmlBg = document.documentElement.style.backgroundColor;
-    
-    document.body.style.backgroundColor = 'transparent';
-    document.documentElement.style.backgroundColor = 'transparent';
     
     const init = async () => {
       try {
         setIsLoading(true);
         setError(null);
         
-        addLog(`Platform: ${Capacitor.getPlatform()}`);
-        addLog('Starting native camera...');
+        const platform = Capacitor.getPlatform();
+        addLog(`Platform: ${platform}`);
         
-        // Start camera
-        await NativeAR.startCamera();
-        addLog('Camera started');
-        
-        // Get zoom info
-        try {
-          const zoomInfo = await NativeAR.getZoom();
-          setCurrentZoom(zoomInfo.zoom);
-          setMaxZoom(zoomInfo.maxZoom);
-          addLog(`Zoom: ${zoomInfo.zoom}x (max: ${zoomInfo.maxZoom}x)`);
-        } catch (e) {
-          addLog('Zoom not available');
+        if (platform === 'android' || platform === 'ios') {
+          // Native mode
+          setIsNative(true);
+          addLog('Starting native camera...');
+          
+          // Make background transparent
+          document.body.style.backgroundColor = 'transparent';
+          document.documentElement.style.backgroundColor = 'transparent';
+          
+          await NativeAR.startCamera();
+          addLog('Native camera started');
+          
+          // Get zoom info
+          try {
+            const zoomInfo: ZoomInfo = await NativeAR.getZoom();
+            setCurrentZoom(zoomInfo.zoom);
+            setMaxZoom(zoomInfo.maxZoom);
+            addLog(`Zoom: ${zoomInfo.zoom}x (max: ${zoomInfo.maxZoom}x)`);
+          } catch (e) {
+            addLog('Zoom not available');
+          }
+          
+          cleanup = () => {
+            NativeAR.stopCamera().catch(console.error);
+            document.body.style.backgroundColor = '';
+            document.documentElement.style.backgroundColor = '';
+          };
+        } else {
+          // Web mode - use getUserMedia
+          setIsNative(false);
+          addLog('Starting web camera...');
+          
+          const stream = await navigator.mediaDevices.getUserMedia({
+            video: {
+              facingMode: 'environment',
+              width: { ideal: 1920 },
+              height: { ideal: 1080 }
+            },
+            audio: false
+          });
+          
+          streamRef.current = stream;
+          
+          if (videoRef.current) {
+            videoRef.current.srcObject = stream;
+            await videoRef.current.play();
+            addLog('Web camera started');
+          }
+          
+          cleanup = () => {
+            stream.getTracks().forEach(track => track.stop());
+            streamRef.current = null;
+          };
         }
-        
-        // Listen for detection updates
-        const listener = await NativeAR.addListener('detectionUpdate', handleDetectionUpdate);
-        cleanup = () => {
-          listener.remove();
-        };
-        
-        // Start detection
-        await NativeAR.startDetection();
-        addLog('Detection started');
         
         setIsLoading(false);
       } catch (err) {
-        console.error('Initialization failed:', err);
+        console.error('Camera init failed:', err);
         const errorMsg = err instanceof Error ? err.message : String(err);
         setError(errorMsg);
         addLog(`Error: ${errorMsg}`);
@@ -101,136 +130,138 @@ export const ARScanner = ({ onTitleFound, onClose, isScanning }: ARScannerProps)
     
     return () => {
       cleanup?.();
-      NativeAR.stopDetection().catch(console.error);
-      NativeAR.stopCamera().catch(console.error);
-      
-      // Restore background
-      document.body.style.backgroundColor = originalBodyBg;
-      document.documentElement.style.backgroundColor = originalHtmlBg;
     };
   }, [isScanning, addLog]);
   
-  // Handle detection updates from native
-  const handleDetectionUpdate = useCallback((event: DetectionUpdateEvent) => {
-    frameDimensionsRef.current = {
-      width: event.frameWidth,
-      height: event.frameHeight
-    };
-    setTrackedObjects(event.objects);
-    
-    // Check for stable objects to process
-    checkStableObjects(event.objects);
-    
-    // Draw overlay
-    drawOverlay(event.objects);
-  }, []);
-  
-  // Check for objects ready for OCR
-  const checkStableObjects = useCallback(async (objects: TrackedObject[]) => {
-    if (isProcessingRef.current) return;
-    
-    for (const obj of objects) {
-      // Check if stable and not yet processed
-      if (
-        obj.stabilityScore >= STABILITY_TRIGGER && 
-        obj.status === 'detecting' &&
-        !processedIdsRef.current.has(obj.id)
-      ) {
-        isProcessingRef.current = true;
-        processedIdsRef.current.add(obj.id);
-        addLog('Scanning detected cover...');
-        
-        try {
-          await processObject(obj.id);
-        } catch (err) {
-          console.error('Processing failed:', err);
-        }
-        
-        isProcessingRef.current = false;
-        break; // Process one at a time
+  // Capture current frame as base64
+  const captureFrame = useCallback(async (): Promise<string | null> => {
+    if (isNative) {
+      // For native, we need to get frame from native plugin
+      // This requires the cropObject method with full frame
+      // For now, fall back to periodic full-frame capture
+      try {
+        const result = await NativeAR.cropObject({ objectId: '__fullframe__' });
+        return result.imageBase64;
+      } catch {
+        // Full frame capture not supported, skip
+        return null;
       }
+    } else {
+      // Web mode - capture from video
+      const video = videoRef.current;
+      if (!video || video.readyState !== 4) return null;
+      
+      const canvas = document.createElement('canvas');
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return null;
+      
+      ctx.drawImage(video, 0, 0);
+      return canvas.toDataURL('image/jpeg', 0.8);
     }
-  }, [addLog]);
+  }, [isNative]);
   
-  // Process a detected object
-  const processObject = async (objectId: string) => {
+  // Analyze frame for covers
+  const analyzeCurrentFrame = useCallback(async () => {
+    if (isAnalyzing) return;
+    
+    const now = Date.now();
+    if (now - lastAnalysisTime.current < ANALYSIS_INTERVAL) return;
+    
+    lastAnalysisTime.current = now;
+    setIsAnalyzing(true);
+    addLog('Analyzing frame...');
+    
     try {
-      // Crop the object
-      const cropResult = await NativeAR.cropObject({ objectId });
-      addLog(`Cropped: ${cropResult.width}x${cropResult.height}`);
-      
-      // OCR with Gemini
-      const extractedTitles = await extractTextFromImage(cropResult.imageBase64);
-      
-      if (!extractedTitles || extractedTitles.length === 0) {
-        await NativeAR.updateObjectStatus({
-          objectId,
-          status: 'failed'
-        });
-        addLog('No text found');
+      const frameBase64 = await captureFrame();
+      if (!frameBase64) {
+        addLog('No frame captured');
+        setIsAnalyzing(false);
         return;
       }
       
-      const rawTitle = extractedTitles[0];
-      addLog(`OCR: "${rawTitle}"`);
+      // Analyze with Gemini Vision
+      const result = await analyzeFrameForCovers(frameBase64);
+      addLog(`Found ${result.covers.length} covers`);
       
-      // Check cache
-      if (titleCacheRef.current.has(rawTitle)) {
-        const cached = titleCacheRef.current.get(rawTitle)!;
-        await NativeAR.updateObjectStatus({
-          objectId,
-          status: 'identified',
-          title: rawTitle,
-          rating: cached.rating
-        });
-        onTitleFound(rawTitle, cached.rating);
-        addLog(`Cache hit: ${rawTitle}`);
-        return;
-      }
-      
-      // Fetch movie data
-      const movieData = await fetchMovieData(rawTitle);
-      
-      if (movieData.title) {
-        const ratingStr = movieData.rating ? movieData.rating.toString() : 'N/A';
-        const votesStr = movieData.votes || '';
+      if (result.covers.length > 0) {
+        // Enrich covers with movie data
+        const enrichedCovers: EnrichedCover[] = result.covers.map(cover => ({
+          ...cover,
+          isLoading: !movieCache.current.has(cover.title.toLowerCase())
+        }));
         
-        // Update cache
-        titleCacheRef.current.set(rawTitle, { rating: ratingStr, votes: votesStr });
+        setDetectedCovers(enrichedCovers);
         
-        // Update React Query cache
-        queryClient.setQueryData(['movieData', rawTitle], movieData);
-        
-        // Update object status
-        await NativeAR.updateObjectStatus({
-          objectId,
-          status: 'identified',
-          title: movieData.title,
-          rating: ratingStr
-        });
-        
-        // Notify parent
-        onTitleFound(rawTitle, ratingStr);
-        addLog(`Found: ${movieData.title} (${ratingStr})`);
-      } else {
-        await NativeAR.updateObjectStatus({
-          objectId,
-          status: 'failed'
-        });
-        addLog('Movie not found');
+        // Fetch movie data for each cover
+        for (const cover of enrichedCovers) {
+          const cacheKey = cover.title.toLowerCase();
+          
+          if (movieCache.current.has(cacheKey)) {
+            // Use cached data
+            const cached = movieCache.current.get(cacheKey)!;
+            setDetectedCovers(prev => prev.map(c => 
+              c.title === cover.title 
+                ? { ...c, movieData: cached, isLoading: false }
+                : c
+            ));
+            
+            if (cached.rating) {
+              onTitleFound(cover.title, cached.rating.toString());
+            }
+          } else {
+            // Fetch new data
+            try {
+              const movieData = await fetchMovieData(cover.title);
+              movieCache.current.set(cacheKey, movieData);
+              
+              setDetectedCovers(prev => prev.map(c => 
+                c.title === cover.title 
+                  ? { ...c, movieData, isLoading: false }
+                  : c
+              ));
+              
+              if (movieData.rating) {
+                onTitleFound(cover.title, movieData.rating.toString());
+              }
+              
+              // Update React Query cache
+              queryClient.setQueryData(['movieData', cover.title], movieData);
+            } catch (err) {
+              console.error(`Failed to fetch data for ${cover.title}:`, err);
+              setDetectedCovers(prev => prev.map(c => 
+                c.title === cover.title 
+                  ? { ...c, isLoading: false }
+                  : c
+              ));
+            }
+          }
+        }
       }
     } catch (err) {
-      console.error('Processing error:', err);
-      await NativeAR.updateObjectStatus({
-        objectId,
-        status: 'failed'
-      });
-      addLog(`Error: ${err instanceof Error ? err.message : 'Unknown'}`);
+      console.error('Frame analysis failed:', err);
+      addLog(`Analysis error: ${err instanceof Error ? err.message : 'Unknown'}`);
     }
-  };
+    
+    setIsAnalyzing(false);
+  }, [isAnalyzing, captureFrame, addLog, onTitleFound, queryClient]);
   
-  // Draw AR overlay
-  const drawOverlay = useCallback((objects: TrackedObject[]) => {
+  // Periodic analysis loop
+  useEffect(() => {
+    if (isLoading || error) return;
+    
+    const interval = setInterval(analyzeCurrentFrame, ANALYSIS_INTERVAL);
+    
+    // Initial analysis
+    analyzeCurrentFrame();
+    
+    return () => clearInterval(interval);
+  }, [isLoading, error, analyzeCurrentFrame]);
+  
+  // Draw overlay with detected covers
+  useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     
@@ -244,103 +275,105 @@ export const ARScanner = ({ onTitleFound, onClose, isScanning }: ARScannerProps)
       canvas.height = rect.height;
     }
     
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    
-    const { width: frameWidth, height: frameHeight } = frameDimensionsRef.current;
-    const scaleX = canvas.width / frameWidth;
-    const scaleY = canvas.height / frameHeight;
-    
-    for (const obj of objects) {
-      if (obj.status === 'failed') continue;
-      if (obj.confirmationFrames < 3 && obj.status === 'detecting') continue;
+    const drawFrame = () => {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
       
-      // Convert normalized bbox to screen coordinates
-      const x = obj.bbox[0] * frameWidth * scaleX;
-      const y = obj.bbox[1] * frameHeight * scaleY;
-      const w = obj.bbox[2] * frameWidth * scaleX;
-      const h = obj.bbox[3] * frameHeight * scaleY;
-      
-      // Draw bounding box
-      ctx.lineJoin = 'round';
-      ctx.lineCap = 'round';
-      ctx.lineWidth = 3;
-      ctx.strokeStyle = getBoxColor(obj.status);
-      
-      // Rounded rectangle
-      const radius = 8;
-      ctx.beginPath();
-      ctx.moveTo(x + radius, y);
-      ctx.lineTo(x + w - radius, y);
-      ctx.quadraticCurveTo(x + w, y, x + w, y + radius);
-      ctx.lineTo(x + w, y + h - radius);
-      ctx.quadraticCurveTo(x + w, y + h, x + w - radius, y + h);
-      ctx.lineTo(x + radius, y + h);
-      ctx.quadraticCurveTo(x, y + h, x, y + h - radius);
-      ctx.lineTo(x, y + radius);
-      ctx.quadraticCurveTo(x, y, x + radius, y);
-      ctx.closePath();
-      ctx.stroke();
-      
-      // Draw label
-      if (obj.status === 'identified' && obj.rating) {
-        const badgeY = y - 45 < 0 ? y + 10 : y - 45;
+      for (const cover of detectedCovers) {
+        const { boundingBox, title, movieData, isLoading: loading } = cover;
         
-        // Background
+        // Convert normalized bbox to screen coordinates
+        const x = boundingBox.x * canvas.width;
+        const y = boundingBox.y * canvas.height;
+        const w = boundingBox.width * canvas.width;
+        const h = boundingBox.height * canvas.height;
+        
+        // Determine color based on state
+        let boxColor = 'rgba(255, 255, 255, 0.8)';
+        if (loading) {
+          boxColor = 'rgba(59, 130, 246, 0.9)'; // Blue while loading
+        } else if (movieData?.rating) {
+          boxColor = 'rgba(74, 222, 128, 0.9)'; // Green when identified
+        }
+        
+        // Draw bounding box with rounded corners
+        ctx.lineJoin = 'round';
+        ctx.lineCap = 'round';
+        ctx.lineWidth = 3;
+        ctx.strokeStyle = boxColor;
+        
+        const radius = 8;
+        ctx.beginPath();
+        ctx.moveTo(x + radius, y);
+        ctx.lineTo(x + w - radius, y);
+        ctx.quadraticCurveTo(x + w, y, x + w, y + radius);
+        ctx.lineTo(x + w, y + h - radius);
+        ctx.quadraticCurveTo(x + w, y + h, x + w - radius, y + h);
+        ctx.lineTo(x + radius, y + h);
+        ctx.quadraticCurveTo(x, y + h, x, y + h - radius);
+        ctx.lineTo(x, y + radius);
+        ctx.quadraticCurveTo(x, y, x + radius, y);
+        ctx.closePath();
+        ctx.stroke();
+        
+        // Semi-transparent fill
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.2)';
+        ctx.fill();
+        
+        // Draw label badge
+        const badgeY = y - 50 < 0 ? y + 10 : y - 50;
+        const badgeWidth = Math.max(w, 180);
+        
+        // Badge background
         ctx.fillStyle = 'rgba(0, 0, 0, 0.85)';
-        const pillWidth = Math.min(w, 280);
         ctx.beginPath();
-        ctx.roundRect(x, badgeY, pillWidth, 40, 6);
+        ctx.roundRect(x, badgeY, badgeWidth, 45, 8);
         ctx.fill();
         
-        // Star
-        ctx.fillStyle = '#FFD700';
-        ctx.font = 'bold 24px sans-serif';
-        ctx.fillText('★', x + 10, badgeY + 28);
-        
-        // Rating
-        ctx.fillStyle = '#FFFFFF';
-        ctx.fillText(obj.rating, x + 40, badgeY + 28);
-        
-        // Title
-        let displayTitle = obj.title || '';
-        if (displayTitle.length > 18) displayTitle = displayTitle.substring(0, 16) + '...';
-        ctx.font = '14px sans-serif';
-        ctx.fillStyle = '#CCC';
-        ctx.fillText(displayTitle, x + 90, badgeY + 28);
-        
-      } else if (obj.status === 'pending_ocr') {
-        // Scanning indicator
-        ctx.fillStyle = 'rgba(59, 130, 246, 0.9)';
-        ctx.beginPath();
-        ctx.roundRect(x, y - 32, 130, 28, 6);
-        ctx.fill();
-        ctx.fillStyle = 'white';
-        ctx.font = 'bold 14px sans-serif';
-        ctx.fillText('🔍 Scanning...', x + 10, y - 12);
-        
-      } else if (obj.status === 'detecting') {
-        // Progress indicator
-        if (obj.stabilityScore > 3) {
-          const progress = Math.min(obj.stabilityScore / STABILITY_TRIGGER, 1);
-          ctx.fillStyle = 'rgba(255, 255, 255, 0.3)';
-          ctx.fillRect(x, y + h + 4, w * progress, 3);
+        if (loading) {
+          // Loading state
+          ctx.fillStyle = '#60a5fa';
+          ctx.font = 'bold 16px system-ui, sans-serif';
+          ctx.fillText('⏳ Loading...', x + 12, badgeY + 28);
+        } else if (movieData?.rating) {
+          // Show rating with star
+          ctx.fillStyle = '#FFD700';
+          ctx.font = 'bold 24px system-ui, sans-serif';
+          ctx.fillText('★', x + 10, badgeY + 30);
+          
+          ctx.fillStyle = '#FFFFFF';
+          ctx.font = 'bold 20px system-ui, sans-serif';
+          ctx.fillText(movieData.rating.toString(), x + 38, badgeY + 30);
+          
+          // Show title (truncated)
+          let displayTitle = movieData.title || title;
+          if (displayTitle.length > 16) {
+            displayTitle = displayTitle.substring(0, 14) + '...';
+          }
+          ctx.font = '13px system-ui, sans-serif';
+          ctx.fillStyle = '#CCC';
+          ctx.fillText(displayTitle, x + 75, badgeY + 30);
+        } else {
+          // No rating found
+          ctx.fillStyle = '#888';
+          ctx.font = '14px system-ui, sans-serif';
+          let displayTitle = title;
+          if (displayTitle.length > 20) {
+            displayTitle = displayTitle.substring(0, 18) + '...';
+          }
+          ctx.fillText(displayTitle, x + 12, badgeY + 28);
         }
       }
-    }
-  }, []);
+      
+      requestAnimationFrame(drawFrame);
+    };
+    
+    const animationId = requestAnimationFrame(drawFrame);
+    return () => cancelAnimationFrame(animationId);
+  }, [detectedCovers]);
   
-  const getBoxColor = (status: TrackedObject['status']) => {
-    switch (status) {
-      case 'detecting': return 'rgba(255, 255, 255, 0.7)';
-      case 'pending_ocr': return '#60a5fa';
-      case 'identified': return '#4ade80';
-      case 'failed': return '#f87171';
-      default: return 'white';
-    }
-  };
-  
-  // Zoom controls
+  // Zoom controls (native only)
   const handleZoomIn = async () => {
+    if (!isNative) return;
     const newZoom = Math.min(currentZoom + 0.5, maxZoom);
     try {
       const result = await NativeAR.setZoom({ zoom: newZoom });
@@ -351,6 +384,7 @@ export const ARScanner = ({ onTitleFound, onClose, isScanning }: ARScannerProps)
   };
   
   const handleZoomOut = async () => {
+    if (!isNative) return;
     const newZoom = Math.max(currentZoom - 0.5, 1.0);
     try {
       const result = await NativeAR.setZoom({ zoom: newZoom });
@@ -360,45 +394,45 @@ export const ARScanner = ({ onTitleFound, onClose, isScanning }: ARScannerProps)
     }
   };
   
-  // Handle close
+  // Manual scan trigger
+  const handleManualScan = () => {
+    lastAnalysisTime.current = 0; // Reset timer
+    analyzeCurrentFrame();
+  };
+  
+  // Close handler
   const handleClose = async () => {
-    try {
-      await NativeAR.stopDetection();
-      await NativeAR.stopCamera();
-    } catch (err) {
-      console.error('Cleanup failed:', err);
+    if (isNative) {
+      try {
+        await NativeAR.stopCamera();
+      } catch (err) {
+        console.error('Stop camera failed:', err);
+      }
+    }
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(track => track.stop());
     }
     onClose();
   };
-  
-  // Continuous overlay rendering
-  useEffect(() => {
-    let animationFrameId: number;
-    
-    const renderLoop = () => {
-      drawOverlay(trackedObjects);
-      animationFrameId = requestAnimationFrame(renderLoop);
-    };
-    
-    if (!isLoading && !error) {
-      animationFrameId = requestAnimationFrame(renderLoop);
-    }
-    
-    return () => {
-      if (animationFrameId) {
-        cancelAnimationFrame(animationFrameId);
-      }
-    };
-  }, [isLoading, error, trackedObjects, drawOverlay]);
 
   return (
-    <div className="relative w-full h-full bg-transparent overflow-hidden flex justify-center items-center">
-      {/* Native camera preview is behind WebView */}
+    <div className="relative w-full h-full bg-black overflow-hidden flex justify-center items-center">
+      {/* Video element for web mode */}
+      {!isNative && (
+        <video
+          ref={videoRef}
+          className="absolute inset-0 w-full h-full object-cover"
+          playsInline
+          autoPlay
+          muted
+        />
+      )}
+      
       {/* AR Overlay Canvas */}
       <canvas 
         ref={canvasRef}
         className="absolute w-full h-full pointer-events-none z-20"
-        style={{ background: 'transparent' }}
+        style={{ background: isNative ? 'transparent' : 'transparent' }}
       />
 
       {/* Loading State */}
@@ -406,7 +440,7 @@ export const ARScanner = ({ onTitleFound, onClose, isScanning }: ARScannerProps)
         <div className="absolute inset-0 flex items-center justify-center bg-black/80 z-50">
           <div className="text-center text-white">
             <Loader2 className="w-10 h-10 animate-spin mx-auto mb-4" />
-            <p>Starting AR Camera...</p>
+            <p>Starting Camera...</p>
           </div>
         </div>
       )}
@@ -415,7 +449,8 @@ export const ARScanner = ({ onTitleFound, onClose, isScanning }: ARScannerProps)
       {error && (
         <div className="absolute inset-0 flex items-center justify-center bg-black/90 z-50">
           <div className="text-center text-white p-4">
-            <p className="text-red-400 mb-4">Camera Error</p>
+            <Camera className="w-12 h-12 text-red-400 mx-auto mb-4" />
+            <p className="text-red-400 mb-2 font-bold">Camera Error</p>
             <p className="text-sm text-gray-400 mb-4">{error}</p>
             <Button onClick={handleClose} variant="secondary">
               Close
@@ -424,7 +459,7 @@ export const ARScanner = ({ onTitleFound, onClose, isScanning }: ARScannerProps)
         </div>
       )}
 
-      {/* Controls */}
+      {/* Top Controls */}
       <div className="absolute top-4 right-4 z-50 flex flex-col gap-2">
         <Button 
           variant="secondary" 
@@ -436,8 +471,8 @@ export const ARScanner = ({ onTitleFound, onClose, isScanning }: ARScannerProps)
         </Button>
       </div>
 
-      {/* Zoom Controls */}
-      {maxZoom > 1 && (
+      {/* Zoom Controls (native only) */}
+      {isNative && maxZoom > 1 && (
         <div className="absolute top-4 left-4 z-50 flex flex-col gap-2">
           <Button 
             variant="secondary" 
@@ -463,16 +498,38 @@ export const ARScanner = ({ onTitleFound, onClose, isScanning }: ARScannerProps)
         </div>
       )}
 
-      {/* Debug Log */}
-      <div className="absolute bottom-20 left-4 z-50 bg-black/60 text-green-400 p-2 rounded text-xs font-mono max-w-[80%] pointer-events-none">
-        {logs.map((log, i) => (
-          <div key={i}>{log}</div>
-        ))}
+      {/* Manual Scan Button */}
+      <div className="absolute bottom-24 left-1/2 -translate-x-1/2 z-50">
+        <Button 
+          onClick={handleManualScan}
+          disabled={isAnalyzing}
+          className="rounded-full bg-white/90 text-black hover:bg-white px-6 py-3 font-semibold shadow-lg"
+        >
+          {isAnalyzing ? (
+            <>
+              <Loader2 className="h-5 w-5 mr-2 animate-spin" />
+              Analyzing...
+            </>
+          ) : (
+            <>
+              <RefreshCw className="h-5 w-5 mr-2" />
+              Scan Now
+            </>
+          )}
+        </Button>
       </div>
-      
-      {/* Object Count */}
-      <div className="absolute top-4 left-1/2 -translate-x-1/2 z-50 bg-black/60 text-white px-3 py-1 rounded-full text-sm">
-        {trackedObjects.filter(o => o.status === 'identified').length} found
+
+      {/* Status Bar */}
+      <div className="absolute top-4 left-1/2 -translate-x-1/2 z-50 bg-black/60 text-white px-4 py-2 rounded-full text-sm flex items-center gap-2">
+        {isAnalyzing && <Loader2 className="h-4 w-4 animate-spin" />}
+        <span>{detectedCovers.length} covers detected</span>
+      </div>
+
+      {/* Debug Log */}
+      <div className="absolute bottom-4 left-4 z-40 bg-black/60 text-green-400 p-2 rounded text-xs font-mono max-w-[70%] pointer-events-none">
+        {logs.map((log, i) => (
+          <div key={i} className="truncate">{log}</div>
+        ))}
       </div>
     </div>
   );
