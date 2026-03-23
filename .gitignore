@@ -33,4 +33,7 @@ dist-ssr
 .augment/rules/byterover-rules.md
 .clinerules
 
-.history
+.history-e 
+# Environment files
+*.env
+*.env.*

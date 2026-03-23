@@ -21,9 +21,9 @@ export const initializeGemini = async () => {
     console.log('Initializing Gemini AI...');
     genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 
-    // Use gemini-2.5-flash-lite for optimal performance and vision capabilities
+    // Use gemini-3.1-flash-lite-preview for optimal performance and vision capabilities
     model = genAI.getGenerativeModel({
-      model: 'gemini-2.5-flash-lite',
+      model: 'gemini-3.1-flash-lite-preview',
       generationConfig: {
         temperature: 0.1,
         topK: 1,

@@ -13,7 +13,17 @@ export interface MovieDataResponse {
   votes: string | null;
 }
 
+// In-memory cache for movie data
+const movieDataCache = new Map<string, MovieDataResponse>();
+
 export const fetchMovieData = async (title: string): Promise<MovieDataResponse> => {
+  const cacheKey = title.toLowerCase().trim();
+  
+  // Check cache first
+  if (movieDataCache.has(cacheKey)) {
+    return movieDataCache.get(cacheKey)!;
+  }
+
   const { title: cleanTitle, year } = extractYearFromTitle(title);
   const options = { language: 'de-DE', region: 'DE' };
 
@@ -39,11 +49,11 @@ export const fetchMovieData = async (title: string): Promise<MovieDataResponse> 
     }
   } catch (error) {
     console.error(`Failed to fetch TMDB data for "${title}":`, error);
-    return baseResponse; // Return consistent base shape on error
+    return baseResponse;
   }
 
-  // If no movie is found at all, return the base shape
   if (!movieData) {
+    movieDataCache.set(cacheKey, baseResponse);
     return baseResponse;
   }
 
@@ -56,8 +66,8 @@ export const fetchMovieData = async (title: string): Promise<MovieDataResponse> 
       confidence: movieData.confidence,
   };
 
-  // If no IMDb ID, we can't get a rating, so return what we have
   if (!movieData.imdbId) {
+    movieDataCache.set(cacheKey, tmdbResponse);
     return tmdbResponse;
   }
 
@@ -70,8 +80,52 @@ export const fetchMovieData = async (title: string): Promise<MovieDataResponse> 
     }
   } catch (error) {
     console.error(`Failed to fetch OMDb rating for "${title}" (IMDb ID: ${movieData.imdbId}):`, error);
-    // On OMDb error, we still return the TMDB data, which is already populated.
   }
 
+  // Cache the result
+  movieDataCache.set(cacheKey, tmdbResponse);
   return tmdbResponse;
+};
+
+/**
+ * Fetch movie data for multiple titles in parallel
+ * Much faster than sequential fetching
+ */
+export const fetchMovieDataBatch = async (titles: string[]): Promise<Map<string, MovieDataResponse>> => {
+  const results = new Map<string, MovieDataResponse>();
+  
+  // Filter out already cached titles
+  const uncachedTitles = titles.filter(title => {
+    const cacheKey = title.toLowerCase().trim();
+    if (movieDataCache.has(cacheKey)) {
+      results.set(title, movieDataCache.get(cacheKey)!);
+      return false;
+    }
+    return true;
+  });
+
+  // Fetch uncached titles in parallel
+  if (uncachedTitles.length > 0) {
+    const promises = uncachedTitles.map(async (title) => {
+      const data = await fetchMovieData(title);
+      return { title, data };
+    });
+
+    const fetchedResults = await Promise.allSettled(promises);
+    
+    for (const result of fetchedResults) {
+      if (result.status === 'fulfilled') {
+        results.set(result.value.title, result.value.data);
+      }
+    }
+  }
+
+  return results;
+};
+
+/**
+ * Clear the movie data cache
+ */
+export const clearMovieCache = () => {
+  movieDataCache.clear();
 };

@@ -15,50 +15,93 @@ Die visuelle Echtzeit-Erkennung von Film-Covern und deren Umrandung (Bounding-Bo
 
 ## Technical Architecture
 
-### Neuer Ansatz (v2.1) - Gemini Vision Cover Detection
-- **Problem gelöst**: Alter Ansatz (Text finden → Cover ableiten) funktioniert nicht
-- **Neuer Ansatz**: Gemini Vision analysiert komplettes Frame → liefert Cover-Positionen + Titel
+### Neuer Ansatz (v2.2) - Optimized Gemini Vision
+- **Modell**: `gemini-3.1-flash-lite-preview` (schneller + besser)
+- **Ansatz**: Gemini Vision analysiert komplettes Frame → liefert Cover-Positionen + Titel
 
 ### Datenfluss:
 ```
-Kamera-Frame → Gemini Vision → Cover-Positionen + Titel → TMDB/OMDb → Rating → Overlay
+Kamera-Frame → Motion Detection → Gemini Vision → Cover-Positionen + Titel 
+    → Parallel TMDB/OMDb → Rating → Smooth Interpolation → Overlay
+```
+
+### Implementierte Optimierungen:
+
+1. **✅ Gemini 3.1 Flash Lite Preview**
+   - Schnelleres und besseres Modell
+
+2. **✅ Parallele API-Aufrufe**
+   - `fetchMovieDataBatch()` - alle Cover gleichzeitig abfragen
+   - 3 Cover = 1x Zeit statt 3x
+
+3. **✅ Motion Detection**
+   - Frame-Hash Vergleich
+   - Nur bei signifikanter Änderung neu analysieren
+   - Spart API-Kosten
+
+4. **✅ Smooth Tracking**
+   - Bounding-Boxes interpolieren zwischen Frames
+   - `SMOOTHING_FACTOR: 0.25` für flüssige Animation
+   - 30 FPS Interpolation
+
+5. **✅ Confidence-basierte Anzeige**
+   - `high`: Solide Linie
+   - `medium`: Gepunktete Linie (orange)
+   - `low`: Gestrichelte Linie (grau)
+
+6. **✅ Lokaler Cover-Cache**
+   - `movieDataCache` in movieService
+   - Sofortige Anzeige für bereits erkannte Cover
+
+7. **✅ Haptic Feedback**
+   - Kurze Vibration bei neuer Cover-Erkennung
+
+8. **✅ Rating Filter**
+   - Filter Button oben rechts
+   - "Alle", "6.0+", "7.0+", "8.0+" Optionen
+
+### Konfiguration (CONFIG):
+```typescript
+ANALYSIS_INTERVAL_MS: 1500,    // Frame-Analyse Intervall
+MOTION_THRESHOLD: 0.02,        // Motion Detection Schwelle
+SMOOTHING_FACTOR: 0.25,        // Box Interpolation
+COVER_TIMEOUT_MS: 3000,        // Cover verschwindet nach X ms
 ```
 
 ### Geänderte Dateien:
-- `src/services/ocrService.ts` - Neue `analyzeFrameForCovers()` Funktion
-- `src/components/ARScanner.tsx` - Kompletter Rewrite mit neuem Ansatz
-- `src/components/LoadingScreen.tsx` - Besseres Error Handling
-- `src/plugins/NativeARPluginWeb.ts` - Full-frame capture Support
-- `android/.../NativeARPlugin.java` - Full-frame capture Support
+- `src/services/ocrService.ts` - Gemini 3.1 + Cover Detection
+- `src/services/movieService.ts` - Parallele Batch-Abfragen + Cache
+- `src/components/ARScanner.tsx` - Alle Optimierungen
+- `src/components/LoadingScreen.tsx` - Demo-Modus
+- `src/plugins/NativeARPluginWeb.ts` - Full-frame Support
+- `android/.../NativeARPlugin.java` - Full-frame Support
 
 ## What's Been Implemented (2026-03-23)
-- [x] Neuer Gemini Vision Ansatz für Cover-Erkennung mit Bounding-Boxes
-- [x] Full-frame capture für beide Plattformen (Native + Web)
-- [x] Periodische Frame-Analyse (2 Sekunden Intervall)
-- [x] Movie Data Caching für Performance
-- [x] Verbessertes Error Handling mit Demo-Modus
-- [x] Canvas-basiertes Overlay mit Bounding-Boxes und Rating-Badges
+- [x] Gemini 3.1 Flash Lite Preview Modell
+- [x] Parallele API-Aufrufe (fetchMovieDataBatch)
+- [x] Motion Detection (Frame-Hash)
+- [x] Smooth Tracking (Box Interpolation)
+- [x] Confidence-basierte Anzeige
+- [x] Lokaler Movie Data Cache
+- [x] Haptic Feedback
+- [x] Rating Filter UI
 
 ## Prioritized Backlog
 
 ### P0 - Kritisch
 - [ ] Testen auf echtem Android-Gerät mit API Keys
-- [ ] Native Frame-Capture Timing optimieren
 
-### P1 - Wichtig
-- [ ] Tracking-Stabilität verbessern (Cover bleiben bei Bewegung)
-- [ ] Geschwindigkeit optimieren (evtl. kürzere Intervalle)
-- [ ] Caching zwischen Frames für flüssigere Anzeige
+### P1 - Wichtig  
+- [ ] Watchlist-Integration (Swipe up = hinzufügen)
+- [ ] Cover-Bild Caching (Poster Preview)
 
 ### P2 - Nice to Have
-- [ ] Offline-Modus mit lokalem Cache
-- [ ] TFLite Model für noch schnellere Cover-Erkennung
-- [ ] Haptic Feedback bei Cover-Erkennung
+- [ ] Offline-Modus mit lokalem SQLite Cache
+- [ ] TFLite Model für noch schnellere On-Device Erkennung
+- [ ] Share-Funktion für erkannte Filme
 
 ## Next Tasks
-1. API Keys in `.env` eintragen:
-   - `VITE_GEMINI_API_KEY`
-   - `VITE_TMDB_API_KEY`
-   - `VITE_OMDB_API_KEY`
-2. App auf echtem Android-Gerät bauen und testen
-3. Frame-Analyse Intervall anpassen basierend auf Performance
+1. API Keys in `.env` eintragen
+2. `yarn build && npx cap sync android && npx cap open android`
+3. Auf echtem Android-Gerät testen
+4. Performance-Tuning basierend auf Tests
